@@ -6,7 +6,7 @@ node_modules/
 
 # Ignore environment variable files
 .env
-
+*.csv
 # Ignore build output
 dist/
 build/
