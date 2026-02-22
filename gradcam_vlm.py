@@ -5,7 +5,7 @@ import cv2
 from PIL import Image
 import timm
 from torchvision import transforms
-from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+from transformers import AutoModelForSeq2SeqLM
 import matplotlib.pyplot as plt
 
 # =====================================================
@@ -21,13 +21,13 @@ MODEL_PATH = "./vlm_model/vlm_epoch_3.pt"
 # IMAGE TRANSFORM
 # =====================================================
 transform = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((224,224)),
     transforms.ToTensor(),
-    transforms.Normalize([0.5]*3, [0.5]*3)
+    transforms.Normalize([0.5]*3,[0.5]*3)
 ])
 
 # =====================================================
-# MODEL
+# MODEL DEFINITION
 # =====================================================
 class VisionLanguageModel(nn.Module):
     def __init__(self):
@@ -36,22 +36,20 @@ class VisionLanguageModel(nn.Module):
         self.vit = timm.create_model(VIT_MODEL, pretrained=False)
         self.vit.head = nn.Identity()
 
-        self.projection = nn.Linear(192, 768)
+        self.projection = nn.Linear(192,768)
         self.lm = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 
-    def forward(self, x):
-        features = self.vit.forward_features(x)
-        return features
+    def forward(self,x):
+        tokens = self.vit.forward_features(x)
+        return tokens
 
-# =====================================================
-# LOAD MODEL
-# =====================================================
+# Load trained model
 model = VisionLanguageModel().to(DEVICE)
 model.load_state_dict(torch.load(MODEL_PATH, map_location=DEVICE))
 model.eval()
 
 # =====================================================
-# GRAD CAM CLASS
+# GRAD-CAM FOR ViT
 # =====================================================
 class ViTGradCAM:
     def __init__(self, model):
@@ -59,70 +57,95 @@ class ViTGradCAM:
         self.gradients = None
         self.activations = None
 
-        # Hook last transformer block
-        self.target_layer = model.vit.blocks[-1].norm1
+        target_layer = model.vit.blocks[-1].norm1
 
-        self.target_layer.register_forward_hook(self.forward_hook)
-        self.target_layer.register_backward_hook(self.backward_hook)
+        target_layer.register_forward_hook(self.save_activation)
+        target_layer.register_full_backward_hook(self.save_gradient)
 
-    def forward_hook(self, module, input, output):
+    def save_activation(self, module, input, output):
         self.activations = output
 
-    def backward_hook(self, module, grad_input, grad_output):
+    def save_gradient(self, module, grad_input, grad_output):
         self.gradients = grad_output[0]
 
     def generate(self, input_tensor):
 
-        output = self.model(input_tensor)
+        # Forward through vision encoder
+        tokens = self.model.vit.forward_features(input_tensor)
 
-        # Use mean activation as target
-        target = output.mean()
+        # Use CLS token for language alignment
+        cls_token = tokens[:,0]
+
+        projected = self.model.projection(cls_token)
+        projected = projected.unsqueeze(1)
+
+        # IMPORTANT: T5 requires decoder input
+        decoder_input_ids = torch.ones((1,1), dtype=torch.long).to(DEVICE)
+
+        outputs = self.model.lm(
+            inputs_embeds=projected,
+            decoder_input_ids=decoder_input_ids,
+            return_dict=True
+        )
+
+        # Use prediction logits as target
+        score = outputs.logits.mean()
 
         self.model.zero_grad()
-        target.backward()
+        score.backward()
 
-        grads = self.gradients.cpu().data.numpy()[0]
-        acts = self.activations.cpu().data.numpy()[0]
+        grads = self.gradients[0].detach().cpu()
+        acts = self.activations[0].detach().cpu()
 
-        weights = np.mean(grads, axis=0)
+        # Remove CLS token
+        grads = grads[1:]
+        acts = acts[1:]
 
-        cam = np.zeros(acts.shape[0], dtype=np.float32)
+        weights = grads.mean(dim=0)
+        cam = torch.matmul(acts, weights)
 
-        for i, w in enumerate(weights):
-            cam += w * acts[i]
+        cam = cam.reshape(14,14).numpy()
 
-        cam = np.maximum(cam, 0)
-        cam = cam.reshape(14, 14)  # ViT patch grid
+        cam = np.maximum(cam,0)
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
 
-        cam = cv2.resize(cam, (224, 224))
-        cam = cam - cam.min()
-        cam = cam / cam.max()
+        cam = cv2.resize(cam,(224,224))
 
         return cam
 
 # =====================================================
-# GENERATE HEATMAP
+# HEATMAP GENERATION (FIXED)
 # =====================================================
-def generate_heatmap(image_path):
+def generate_heatmap(path):
 
-    image = Image.open(image_path).convert("RGB")
+    image = Image.open(path).convert("RGB")
     img_tensor = transform(image).unsqueeze(0).to(DEVICE)
 
     gradcam = ViTGradCAM(model)
     cam = gradcam.generate(img_tensor)
 
-    # Convert image to numpy
-    img = np.array(image.resize((224, 224))) / 255.0
+    img = np.array(image.resize((224,224))) / 255.0
 
-    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
-    heatmap = heatmap / 255.0
+    # 🔥 Adaptive threshold (top 20%)
+    thresh = np.percentile(cam, 80)
+    cam_filtered = cam.copy()
+    cam_filtered[cam_filtered < thresh] = 0
 
-    overlay = heatmap * 0.4 + img
+    # Normalize again after threshold
+    cam_filtered = cam_filtered / (cam_filtered.max() + 1e-8)
+
+    # Create heatmap
+    heatmap = cv2.applyColorMap(np.uint8(255*cam_filtered), cv2.COLORMAP_JET)
+    heatmap = heatmap.astype(float)/255
+
+    # Better overlay blending
+    overlay = img * 0.7 + heatmap * 0.5
+    overlay = np.clip(overlay, 0, 1)
 
     return img, cam, overlay
 
 # =====================================================
-# RUN
+# MAIN
 # =====================================================
 if __name__ == "__main__":
 
@@ -138,8 +161,8 @@ if __name__ == "__main__":
     plt.axis("off")
 
     plt.subplot(1,3,2)
-    plt.title("Grad-CAM")
-    plt.imshow(cam, cmap="jet")
+    plt.title("GradCAM Heatmap")
+    plt.imshow(cam,cmap="jet")
     plt.axis("off")
 
     plt.subplot(1,3,3)
