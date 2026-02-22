@@ -124,22 +124,30 @@ def generate_heatmap(path):
     gradcam = ViTGradCAM(model)
     cam = gradcam.generate(img_tensor)
 
+    # Convert image to numpy
     img = np.array(image.resize((224,224))) / 255.0
 
-    # 🔥 Adaptive threshold (top 20%)
-    thresh = np.percentile(cam, 80)
-    cam_filtered = cam.copy()
-    cam_filtered[cam_filtered < thresh] = 0
+    # -------------------------------
+    # 🔥 NEW PROFESSIONAL VISUALIZATION
+    # -------------------------------
 
-    # Normalize again after threshold
-    cam_filtered = cam_filtered / (cam_filtered.max() + 1e-8)
+    # Smooth CAM to remove patch noise
+    cam_smooth = cv2.GaussianBlur(cam, (21,21), 0)
+
+    # Normalize
+    cam_smooth = (cam_smooth - cam_smooth.min()) / (cam_smooth.max() + 1e-8)
+
+    # Keep only strongest regions
+    threshold = np.percentile(cam_smooth, 85)
+    cam_mask = np.zeros_like(cam_smooth)
+    cam_mask[cam_smooth >= threshold] = cam_smooth[cam_smooth >= threshold]
 
     # Create heatmap
-    heatmap = cv2.applyColorMap(np.uint8(255*cam_filtered), cv2.COLORMAP_JET)
+    heatmap = cv2.applyColorMap(np.uint8(255*cam_mask), cv2.COLORMAP_JET)
     heatmap = heatmap.astype(float)/255
 
-    # Better overlay blending
-    overlay = img * 0.7 + heatmap * 0.5
+    # Blend overlay
+    overlay = img * 0.7 + heatmap * 0.6
     overlay = np.clip(overlay, 0, 1)
 
     return img, cam, overlay
