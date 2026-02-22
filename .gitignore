@@ -3,14 +3,14 @@ node_modules/
 
 # Ignore log files
 *.log
-
+*.pt
 # Ignore environment variable files
 .env
 *.csv
 # Ignore build output
 dist/
 build/
-
+vlm_model/
 # Ignore system files
 .DS_Store
 Thumbs.db
